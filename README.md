@@ -38,18 +38,6 @@ Windows (WSL2)
 - `tests/cb-tui-smoke.py` — drives the TUI in a pty; `--live` also creates and
   deletes a throwaway container.
 
-## Quick start (host already set up)
-
-```bash
-cb create my-repo     # clone dev-golden, mount /mnt/wsl/code/my-repo, inject creds, start
-cb login  my-repo     # shell as colin; git clone into /mnt/wsl/code/my-repo
-cb tui                # manage everything from one screen (keyboard + mouse)
-cb destroy my-repo    # delete the container; code on /mnt/wsl/code stays
-```
-
-`cb help` lists the rest (`start|stop|restart|status|list`, and
-`docker-setup|github-setup|kiro-setup <name>` to re-inject credentials).
-
 ## Setting this up on a new machine
 
 Read this whole section once before starting. Steps are ordered; each one
