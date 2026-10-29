@@ -1,0 +1,14 @@
+[Unit]
+Description=Allow Incus bridge forwarding through Docker firewall
+Documentation=man:iptables(8)
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ensure-incus-forwarding.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=docker.service

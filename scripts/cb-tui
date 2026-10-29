@@ -1,0 +1,858 @@
+#!/usr/bin/env bash
+# cb-tui — a pure-bash full-screen TUI to manage Incus instances on this host.
+# Launch with `scripts/cb-tui` or `scripts/cb tui`. No dependencies beyond
+# incus + tput + bash. Use `--once` to render a single frame (non-interactive).
+#
+# Keys:  j/k or arrows = move | PgUp/PgDn page | g/G top/bottom
+#        s start | x stop | r restart | l/Enter login (starts it first if stopped)
+#        i info | c create | d destroy | / live filter | o order (running first)
+#        Esc clear filter | ? help | q quit
+# Mouse: click = select | double-click = login | wheel = scroll the pane
+#        (the selection stays put; any arrow key brings it back into view)
+#        click a footer hint = that action | click the docker-host badge = re-probe
+#
+# Built for hundreds of instances:
+#   * scrolling viewport sized to the terminal (never taller than the screen)
+#   * `incus list` and the docker-host probe run on timers, not per frame
+#   * render does ZERO forks — no $(subshells), no tput per frame — because
+#     key autorepeat otherwise queues frames faster than they can be drawn
+#   * held keys are coalesced: a burst moves the selection once, then redraws
+#   * lifecycle ops (start/stop/restart/delete) run as background jobs, so
+#     starting three containers does not freeze the UI for thirty seconds
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=lib.sh
+source "$HERE/lib.sh"
+
+ONCE=0
+[ "${1:-}" = "--once" ] && ONCE=1
+
+# --- tunables ---
+: "${TUI_FETCH_INTERVAL:=5}"   # seconds between `incus list` refreshes
+: "${TUI_DH_INTERVAL:=15}"     # seconds between docker-host probes
+: "${TUI_KEY_TIMEOUT:=1}"      # input poll interval (frame rate floor)
+: "${TUI_JOB_TICK:=0.2}"       # poll interval while background jobs run (spinner)
+: "${TUI_DRAIN_MAX:=2000}"     # safety cap on keys coalesced per burst
+: "${TUI_DCLICK_MS:=400}"      # two clicks on the same row within this = login
+: "${TUI_WHEEL_STEP:=3}"       # rows scrolled per wheel notch
+: "${TUI_LOGIN_WAIT:=45}"      # seconds to wait for a freshly started instance to accept exec
+
+# --- colors ---
+C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_REV=$'\033[7m'
+C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_CYAN=$'\033[36m'
+
+# --- terminal control strings ---
+# SGR (1006) mouse reporting: coordinates are decimal, so terminals wider than
+# 223 columns work. Mode 1000 = button presses/releases + wheel, no motion.
+MOUSE_ON=$'\033[?1000h\033[?1006h'; MOUSE_OFF=$'\033[?1006l\033[?1000l'
+# Autowrap off: a line longer than the terminal is clipped instead of wrapping
+# and shoving the whole frame down a row.
+WRAP_OFF=$'\033[?7l'; WRAP_ON=$'\033[?7h'
+
+# --- state ---
+SEL=0            # index into VIEW
+SEL_NAME=""      # name under the cursor — re-found after each refresh/re-sort
+SCROLL=0         # first visible VIEW index
+FOLLOW=1         # 1 = viewport tracks the selection (keyboard); 0 = free scroll (wheel)
+FILTER=""
+SORT=name        # name | state (RUNNING first, then incus's name order)
+MODE=list        # list | filter | create | confirm  (what the status line is doing)
+PBUF=""          # text being typed in filter/create mode
+CONFIRM_NAME=""  # instance awaiting a y/N in confirm mode
+STATUS="ready"
+LAST_FETCH=0; NEED_FETCH=0
+DH_CACHE=""; DH_TS=0
+COLS=80; TLINES=24; VIEW_ROWS=19
+NAMEW=4          # name column width; see compute_namew
+NEED_SIZE=1
+KEY=""
+MB=0; MX=0; MY=0; MPRESS=0          # last parsed mouse event
+LAST_CLICK_MS=0; LAST_CLICK_ROW=-1  # double-click detection
+BURST=0          # 1 while applying keys that were already queued (drain loop)
+HAVE_DATA=0      # 1 once `incus list` has succeeded at least once
+RUNNING_N=0
+SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; SPIN_I=0
+JOBDIR=""
+G=""             # out-param of gerund()
+# Initialized empty (not just declared): lib.sh runs `set -u`, and ${#VIEW[@]}
+# on a declared-but-never-assigned array aborts the shell.
+declare -a NAMES=() STATES=() TYPES=() IPS=() VIEW=()
+declare -A PENDING=() JOBPID=()     # name -> verb / background pid
+
+# Footer hints. Labels are rendered left to right separated by one space; the
+# column span of each is computed once so a mouse click can be mapped back.
+HINT_LABEL=("[j/k]move" "[PgUp/PgDn]" "[g/G]" "[s]tart" "[x]stop" "[r]estart" "[l]ogin"
+            "[i]nfo" "[c]reate" "[d]estroy" "[/]filter" "[o]rder" "[?]help" "[q]uit")
+HINT_KEY=(  ""          ""            ""      s         x        r          l
+            i        c          d           /           o         '?'      q)
+declare -a HINT_X0=() HINT_X1=()
+FOOTER=""
+DH_X0=0; DH_X1=0   # column span of the clickable docker-host badge on row 1
+
+# --- terminal lifecycle ---
+setup_term()   { tput smcup 2>/dev/null; tput civis 2>/dev/null; printf '%s%s' "$MOUSE_ON" "$WRAP_OFF"; }
+cleanup_term() {
+  printf '%s%s' "$MOUSE_OFF" "$WRAP_ON"; tput cnorm 2>/dev/null; tput rmcup 2>/dev/null
+  local n=${#JOBPID[@]}
+  (( n > 0 )) && printf 'note: %d background operation(s) still running (%s); they will finish on their own.\n' \
+                  "$n" "${!JOBPID[*]}"
+  [ -n "$JOBDIR" ] && [ -d "$JOBDIR" ] && rm -rf -- "$JOBDIR"
+  return 0
+}
+# Leaving the alt screen for a child (login shell, create) MUST switch mouse
+# reporting off, or the child receives clicks as garbage escape sequences.
+suspend_tui()  { printf '%s%s' "$MOUSE_OFF" "$WRAP_ON"; tput cnorm 2>/dev/null; tput rmcup 2>/dev/null; }
+resume_tui()   { tput smcup 2>/dev/null; tput civis 2>/dev/null; printf '%s%s' "$MOUSE_ON" "$WRAP_OFF"; drain_input; NEED_SIZE=1; }
+
+# Swallow whatever is queued on stdin (e.g. the tail of a mouse sequence after a
+# "press any key" read, or keys typed while a child had the terminal).
+drain_input() { local _; while read -rsn1 -t 0.01 _; do :; done; return 0; }
+
+# Terminal size is read only at startup and on SIGWINCH — `tput` is a fork.
+update_size() {
+  COLS=$(tput cols 2>/dev/null || echo 80)
+  TLINES=$(tput lines 2>/dev/null || echo 24)
+  VIEW_ROWS=$(( TLINES - 5 ))     # 2 header lines + 3 footer lines
+  (( VIEW_ROWS < 3 )) && VIEW_ROWS=3
+  build_footer
+  compute_namew
+  return 0
+}
+
+# Name column width. Fixed for the life of a list: it is derived from the
+# longest name in the WHOLE list (not the visible window) and capped by the
+# terminal width, so it only changes on resize or when the set of instances
+# changes — never while scrolling. Sizing to the visible rows made the columns
+# jump every time a long name scrolled in or out.
+# Other columns: "❯ " + 2 gaps + TYPE(4) + gap + STATE(12) + gap + IPv4(15) = 39.
+compute_namew() {
+  local n w=4
+  for n in "${NAMES[@]}"; do (( ${#n} > w )) && w=${#n}; done
+  local cap=$(( COLS - 39 ))
+  (( w > cap )) && w=$cap
+  (( w < 4 )) && w=4
+  NAMEW=$w
+  return 0
+}
+viewport_rows() { printf '%s' "$VIEW_ROWS"; }
+
+# Footer text + per-hint column spans (1-based, inclusive). Rebuilt on resize:
+# when the terminal is too narrow for everything, the pure-navigation hints
+# (the ones with no key to click) are dropped first. The [key] part is drawn
+# at normal intensity so the click targets stand out from the dim labels.
+build_footer() {
+  local i col=1 lbl full=0 keep
+  for lbl in "${HINT_LABEL[@]}"; do full=$(( full + ${#lbl} + 1 )); done
+  FOOTER=""; HINT_X0=(); HINT_X1=()
+  for i in "${!HINT_LABEL[@]}"; do
+    lbl=${HINT_LABEL[$i]}
+    keep=1; (( full > COLS )) && [ -z "${HINT_KEY[$i]}" ] && keep=0
+    if (( keep )); then
+      HINT_X0[i]=$col; HINT_X1[i]=$(( col + ${#lbl} - 1 ))
+      FOOTER+="${C_RESET}${lbl%%]*}]${C_DIM}${lbl#*]} "
+      col=$(( col + ${#lbl} + 1 ))
+    else
+      HINT_X0[i]=0; HINT_X1[i]=-1
+    fi
+  done
+  FOOTER=${FOOTER% }
+  return 0
+}
+
+gerund() { # $1=verb -> G="starting" etc.
+  case "$1" in
+    stop) G=stopping;; delete) G=deleting;; *) G="${1}ing";;
+  esac
+}
+
+# --- data ---
+# Bounded, and it never destroys the list it already has: if the daemon stalls
+# mid-session, keep showing the last known instances and say so in the status
+# line. Blanking the list on a transient failure is indistinguishable from
+# "you have no instances", which is a lie.
+list_cmd() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$INCUS_TIMEOUT" incus list --format csv -c n,s,t,4 2>/dev/null
+  else
+    incus list --format csv -c n,s,t,4 2>/dev/null
+  fi
+}
+
+fetch_failed() { # $1=rc
+  if (( $1 == 124 )); then
+    STATUS="incus list timed out after ${INCUS_TIMEOUT}s — showing last known list"
+  else
+    STATUS="incus list failed (rc=$1) — showing last known list"
+  fi
+  build_view
+}
+
+parse_list() { # $1=csv text
+  NAMES=(); STATES=(); TYPES=(); IPS=()
+  local line name state type rest ip
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    IFS=',' read -r name state type rest <<<"$line"
+    rest="${rest%\"}"; rest="${rest#\"}"
+    ip="${rest%% *}"      # drop " (eth0)" suffix
+    ip="${ip%%,*}"        # first of multiple
+    [ -z "$ip" ] && ip="-"
+    NAMES+=("$name"); STATES+=("$state"); TYPES+=("$type"); IPS+=("$ip")
+  done <<<"$1"
+  HAVE_DATA=1
+  compute_namew
+  build_view
+  return 0
+}
+
+# Synchronous fetch: used for the first frame and for --once.
+fetch_instances() {
+  local out rc=0
+  out="$(list_cmd)" || rc=$?
+  if (( rc != 0 )); then fetch_failed "$rc"; return 0; fi
+  parse_list "$out"
+  return 0
+}
+
+# Asynchronous refresh for the main loop. `incus list` takes ~0.4s with a
+# hundred instances; doing it inline froze input for that long every interval
+# (and made a double-click's second press land late). The child writes to a
+# file; reap_fetch() reads it with the mapfile builtin once the child is gone.
+FETCH_PID=""
+start_fetch() {
+  [ -n "$FETCH_PID" ] && return 0
+  ( list_cmd >"$JOBDIR/list.tmp" </dev/null && mv -f "$JOBDIR/list.tmp" "$JOBDIR/list.csv" ) &
+  FETCH_PID=$!
+  return 0
+}
+reap_fetch() {
+  [ -n "$FETCH_PID" ] || return 0
+  kill -0 "$FETCH_PID" 2>/dev/null && return 0
+  local rc=0; wait "$FETCH_PID" 2>/dev/null || rc=$?
+  FETCH_PID=""
+  if (( rc != 0 )); then fetch_failed "$rc"; return 0; fi
+  local -a lines=(); local joined=""
+  mapfile -t lines <"$JOBDIR/list.csv"
+  (( ${#lines[@]} )) && printf -v joined '%s\n' "${lines[@]}"
+  parse_list "$joined"
+  return 0
+}
+
+# VIEW holds the indices of NAMES passing FILTER, in display order; SEL/SCROLL
+# index VIEW. The selection follows the *instance* (SEL_NAME), not the row
+# number, so a refresh or re-sort that reorders rows never moves the cursor
+# onto a different container.
+build_view() {
+  VIEW=(); RUNNING_N=0
+  local i; local -a rest=()
+  for i in "${!NAMES[@]}"; do
+    [ "${STATES[$i]}" = RUNNING ] && RUNNING_N=$(( RUNNING_N + 1 ))
+    if [ -z "$FILTER" ] || [[ "${NAMES[$i],,}" == *"${FILTER,,}"* ]]; then
+      if [ "$SORT" = state ] && [ "${STATES[$i]}" != RUNNING ]; then rest+=("$i"); else VIEW+=("$i"); fi
+    fi
+  done
+  (( ${#rest[@]} )) && VIEW+=("${rest[@]}")
+  if [ -n "$SEL_NAME" ]; then
+    for i in "${!VIEW[@]}"; do
+      if [ "${NAMES[${VIEW[$i]}]}" = "$SEL_NAME" ]; then SEL=$i; break; fi
+    done
+  fi
+  clamp_sel
+  return 0
+}
+
+# A changed filter restarts from the top; SEL_NAME is dropped on purpose so
+# build_view doesn't drag the cursor back to the previously selected row.
+reset_view() { SEL=0; SCROLL=0; SEL_NAME=""; FOLLOW=1; build_view; }
+
+# Pin the viewport inside the list. SEL is NOT consulted: the wheel scrolls the
+# pane independently of the selection, which may be off-screen.
+clamp_scroll() {
+  local total=${#VIEW[@]} rows=$VIEW_ROWS
+  if (( total <= rows )); then SCROLL=0
+  elif (( SCROLL > total - rows )); then SCROLL=$(( total - rows )); fi
+  (( SCROLL < 0 )) && SCROLL=0
+  return 0
+}
+
+clamp_sel() {
+  local n=${#VIEW[@]}
+  if (( n == 0 )); then SEL=0; SCROLL=0; SEL_NAME=""; return 0; fi
+  (( SEL >= n )) && SEL=$(( n - 1 ))
+  (( SEL < 0 )) && SEL=0
+  SEL_NAME=${NAMES[${VIEW[$SEL]}]}
+  return 0
+}
+
+# Probe docker-host at most every $TUI_DH_INTERVAL seconds.
+# MUST be called directly, never as $(dh_probe): a command substitution runs in a
+# subshell, so the cache assignments below would be discarded and every frame
+# would re-open a TCP connection (~100ms up, a full 1s timeout when down —
+# which starves keyboard input and looks like a lockup on held keys).
+dh_probe() {
+  local now=$SECONDS
+  if [ -z "$DH_CACHE" ] || (( now - DH_TS >= TUI_DH_INTERVAL )); then
+    if timeout 1 bash -c "echo > /dev/tcp/$DH_ADDR/$DH_PORT" 2>/dev/null; then
+      DH_CACHE=up
+    else
+      DH_CACHE=down
+    fi
+    DH_TS=$now
+  fi
+  return 0
+}
+
+# Convenience wrapper for tests/scripts; inside render use dh_probe directly.
+dh_status() { dh_probe; printf '%s' "$DH_CACHE"; }
+
+# --- background jobs ---
+# incus start/stop can take seconds (stop up to 30s if the guest ignores SIGPWR).
+# Run them detached, remember the pid, and reap in the main loop. kill -0 works
+# as a liveness test because bash reaps children on SIGCHLD and keeps the exit
+# status for a later `wait`.
+start_job() { # $1=name $2=verb $3..=command
+  local n="$1" verb="$2"; shift 2
+  if [ -n "${PENDING[$n]:-}" ]; then
+    gerund "${PENDING[$n]}"; STATUS="'$n' is already $G"
+    return 1
+  fi
+  ( "$@" >"$JOBDIR/$n.log" 2>&1 </dev/null ) &
+  JOBPID[$n]=$!; PENDING[$n]=$verb
+  return 0
+}
+
+reap_jobs() {
+  local n pid rc msg
+  for n in "${!JOBPID[@]}"; do
+    pid=${JOBPID[$n]}
+    kill -0 "$pid" 2>/dev/null && continue
+    wait "$pid" 2>/dev/null; rc=$?
+    if (( rc == 0 )); then
+      STATUS="${PENDING[$n]} ok: '$n'"
+    else
+      msg=""; [ -s "$JOBDIR/$n.log" ] && read -r msg <"$JOBDIR/$n.log"
+      msg=${msg#Error: }
+      STATUS="${PENDING[$n]} FAILED: '$n' — ${msg:-rc=$rc}"
+    fi
+    unset "JOBPID[$n]" "PENDING[$n]"
+    invalidate
+  done
+  return 0
+}
+
+# --- render (fork-free: only printf -v and parameter expansion) ---
+render() {
+  local total=${#VIEW[@]} rows i idx namew=$NAMEW n first last
+  if (( ONCE )); then rows=$total; else rows=$VIEW_ROWS; fi
+  (( rows < 1 )) && rows=1
+
+  # keyboard navigation keeps the selection inside the window; wheel scrolling
+  # (FOLLOW=0) leaves the window where the user put it. Then pin it to the list.
+  if (( FOLLOW )); then
+    (( SEL < SCROLL )) && SCROLL=$SEL
+    (( SEL >= SCROLL + rows )) && SCROLL=$(( SEL - rows + 1 ))
+  fi
+  if (( total <= rows )); then SCROLL=0
+  elif (( SCROLL > total - rows )); then SCROLL=$(( total - rows )); fi
+  (( SCROLL < 0 )) && SCROLL=0
+
+  first=$SCROLL; last=$(( SCROLL + rows - 1 )); (( last >= total )) && last=$(( total - 1 ))
+
+  local njobs=${#JOBPID[@]} spin=""
+  if (( njobs > 0 )); then SPIN_I=$(( (SPIN_I + 1) % ${#SPIN} )); spin=${SPIN:SPIN_I:1}; fi
+
+  local eol=""; (( ONCE )) || eol=$'\033[K'
+  local out=""
+  (( ONCE )) || out+=$'\033[H'
+
+  # header
+  local dh dhcell counter filtnote sortnote prefix badge line
+  dh_probe; dh="$DH_CACHE"              # direct call — $( ) would void the cache
+  if (( total > 0 )); then counter="$((SEL+1))/$total"; else counter="0/0"; fi
+  prefix="cb-tui  ${counter}  ${RUNNING_N} running  "
+  badge="docker-host: ● ${dh} (${DH_ADDR}:${DH_PORT})"
+  DH_X0=$(( ${#prefix} + 1 )); DH_X1=$(( ${#prefix} + ${#badge} ))
+  if (( ONCE )); then dhcell="$dh"
+  elif [ "$dh" = up ]; then dhcell="${C_GREEN}● up${C_RESET}"
+  else dhcell="${C_RED}● down${C_RESET}"; fi
+  sortnote=""; [ "$SORT" = state ] && sortnote="  ${C_DIM}sort:running-first${C_RESET}"
+  filtnote=""; [ -n "$FILTER" ] && filtnote="  ${C_YEL}filter:${FILTER}${C_RESET}"
+  out+="${C_BOLD}${C_CYAN}cb-tui${C_RESET}  ${counter}  ${C_GREEN}${RUNNING_N}${C_RESET} running  docker-host: ${dhcell} (${DH_ADDR}:${DH_PORT})${sortnote}${filtnote}${eol}"$'\n'
+  printf -v line '%-*s  %-4s  %-12s  %s' "$namew" NAME TYPE STATE IPV4
+  out+="${C_DIM}${line}${C_RESET}${eol}"$'\n'
+
+  # rows
+  if (( total == 0 )); then
+    if (( ! HAVE_DATA )); then
+      out+="  ${C_RED}(no data — 'incus list' has not succeeded yet; see status below)${C_RESET}${eol}"$'\n'
+    elif [ -n "$FILTER" ]; then
+      out+="  ${C_DIM}(no instance matches '${FILTER}' — keep typing, Esc to clear)${C_RESET}${eol}"$'\n'
+    else
+      out+="  ${C_DIM}(no instances — press c to create one)${C_RESET}${eol}"$'\n'
+    fi
+    n=$(( rows - 1 )); while (( n-- > 0 )); do out+="${eol}"$'\n'; done
+  else
+    local ty st col plain mark nm pad pend
+    for (( i=first; i<=last; i++ )); do
+      idx=${VIEW[$i]}
+      case "${TYPES[$idx]}" in
+        CONTAINER) ty=CT;; VIRTUAL-MACHINE) ty=VM;; *) ty="${TYPES[$idx]:0:2}";;
+      esac
+      # Name clipped with an ellipsis; padded by hand because bash's printf
+      # pads by bytes and '…' is three of them.
+      nm=${NAMES[$idx]}
+      (( ${#nm} > namew )) && nm="${nm:0:namew-1}…"
+      printf -v pad '%*s' $(( namew - ${#nm} )) ''
+      st="${STATES[$idx]}"
+      pend=${PENDING[${NAMES[$idx]}]:-}
+      if (( ONCE )); then
+        mark="  "; (( i == SEL )) && mark="> "
+        [ -n "$pend" ] && { gerund "$pend"; st="$G…"; }
+        printf -v plain '%-4s  * %-10s  %s' "$ty" "$st" "${IPS[$idx]}"
+        out+="${mark}${nm}${pad}  ${plain}"$'\n'
+      elif (( i == SEL )); then
+        [ -n "$pend" ] && { gerund "$pend"; st="$G $spin"; }
+        printf -v plain '%-4s  %-12s  %s' "$ty" "$st" "${IPS[$idx]}"
+        out+="${C_CYAN}❯ ${C_REV}${nm}${pad}  ${plain}${C_RESET}${eol}"$'\n'
+      else
+        if [ -n "$pend" ]; then
+          gerund "$pend"; col=$C_YEL; st="$G $spin"
+        else
+          case "$st" in
+            RUNNING) col=$C_GREEN;; STOPPED) col=$C_RED;; *) col=$C_YEL;;
+          esac
+        fi
+        printf -v plain '%-4s  ' "$ty"
+        out+="  ${nm}${pad}  ${plain}${col}● ${C_RESET}"
+        printf -v plain '%-10s  %s' "$st" "${IPS[$idx]}"
+        out+="${plain}${eol}"$'\n'
+      fi
+    done
+    n=$(( rows - (last - first + 1) )); while (( n-- > 0 )); do out+="${eol}"$'\n'; done
+  fi
+
+  # footer
+  local more=""
+  (( total > rows )) && more="  ${C_DIM}[$((first+1))-$((last+1)) of $total]${C_RESET}"
+  if (( total > 0 && SEL < first )); then more+="  ${C_CYAN}↑ selection${C_RESET}"
+  elif (( total > 0 && SEL > last )); then more+="  ${C_CYAN}↓ selection${C_RESET}"; fi
+  out+="${eol}"$'\n'
+  out+="${C_DIM}${FOOTER}${C_RESET}${more}${eol}"$'\n'
+  case "$MODE" in
+    filter)  out+="${C_BOLD}${C_YEL}filter:${C_RESET} ${PBUF}${C_REV} ${C_RESET}  ${C_DIM}${#VIEW[@]} match(es) · Enter keep · Esc clear · ↑↓ move${C_RESET}";;
+    create)  out+="${C_BOLD}${C_YEL}new instance name:${C_RESET} ${PBUF}${C_REV} ${C_RESET}  ${C_DIM}Enter create · Esc cancel${C_RESET}";;
+    confirm) out+="${C_BOLD}${C_RED}delete '${CONFIRM_NAME}'?${C_RESET} code in ${REPO_ROOT}/${CONFIRM_NAME} is kept  ${C_BOLD}[y/N]${C_RESET}";;
+    *)       out+="${C_BOLD}status:${C_RESET} ${STATUS}"
+             (( njobs > 0 )) && out+="  ${C_YEL}${spin} ${njobs} op(s) running${C_RESET}";;
+  esac
+  # No trailing newline when interactive: a final \n on the last terminal row
+  # scrolls the whole frame up by one and the header walks off-screen.
+  if (( ONCE )); then out+=$'\n'; else out+=$'\033[K\033[J'; fi
+
+  printf '%s' "$out"
+}
+
+# --- actions ---
+selected_name() {
+  (( ${#VIEW[@]} == 0 )) && return 1
+  printf '%s' "${NAMES[${VIEW[$SEL]}]}"
+}
+
+invalidate() { NEED_FETCH=1; }   # force a data refresh next loop
+
+act_lifecycle() { # $1=verb (start|stop|restart)
+  local verb="$1" n st
+  (( ${#VIEW[@]} == 0 )) && { STATUS="no instance selected"; return 0; }
+  n=${NAMES[${VIEW[$SEL]}]}; st=${STATES[${VIEW[$SEL]}]}
+  # Only trust the cached state when no refresh is pending (right after a login
+  # or a finished job it is stale for ~0.5s); otherwise let incus be the judge.
+  if [ -z "$FETCH_PID" ] && (( ! NEED_FETCH )); then
+    case "$verb" in
+      start)   [ "$st" = RUNNING ] && { STATUS="'$n' is already running"; return 0; };;
+      stop)    [ "$st" = STOPPED ] && { STATUS="'$n' is already stopped"; return 0; };;
+      # incus restart errors on a stopped instance ("already stopped"); treat it as start.
+      restart) [ "$st" != RUNNING ] && verb=start;;
+    esac
+  fi
+  if start_job "$n" "$verb" incus "$verb" "$n"; then
+    gerund "$verb"; STATUS="$G '$n' in the background…"
+  fi
+  return 0
+}
+
+act_login() {
+  local n st i
+  (( ${#VIEW[@]} == 0 )) && { STATUS="no instance selected"; return 0; }
+  n=${NAMES[${VIEW[$SEL]}]}
+  suspend_tui
+  if [ -n "${JOBPID[$n]:-}" ]; then
+    printf '\nwaiting for %s of %s to finish…\n' "${PENDING[$n]}" "$n"
+    wait "${JOBPID[$n]}" 2>/dev/null || true
+    unset "JOBPID[$n]" "PENDING[$n]"
+    invalidate
+  fi
+  # name=… is an exact match; a bare "$n" is a prefix regex (buildserver → buildservers too)
+  st=$(incus list "name=$n" --format csv -c s 2>/dev/null | head -1)
+  if [ "$st" != RUNNING ]; then
+    printf '\n%s is %s — starting it first…\n' "$n" "${st:-UNKNOWN}"
+    if ! incus start "$n"; then
+      printf '\nstart failed. Press Enter to return to cb-tui…'; read -r _ || true
+      resume_tui; STATUS="login aborted: could not start '$n'"; invalidate
+      return 0
+    fi
+    invalidate
+    # Containers accept exec almost immediately; VMs need incus-agent (~12s).
+    for (( i=0; i<TUI_LOGIN_WAIT; i++ )); do
+      incus exec "$n" -- true >/dev/null 2>&1 && break
+      (( i == 0 )) && printf 'waiting for %s to accept connections' "$n"
+      printf '.'; sleep 1
+    done
+    printf '\n'
+  fi
+  printf '\n=== shell on %s (exit to return) ===\n' "$n"
+  incus exec "$n" -- su -l colin || true
+  resume_tui
+  STATUS="returned from shell on '$n'"
+  invalidate
+  return 0
+}
+
+act_info() {
+  local n
+  (( ${#VIEW[@]} == 0 )) && { STATUS="no instance selected"; return 0; }
+  n=${NAMES[${VIEW[$SEL]}]}
+  suspend_tui
+  {
+    printf '=== incus info %s ===\n' "$n"
+    incus info "$n" 2>&1
+    printf '\n=== incus config show %s --expanded ===\n' "$n"
+    incus config show "$n" --expanded 2>&1
+    printf '\n=== repo dir ===\n%s/%s' "$REPO_ROOT" "$n"
+    if [ -d "$REPO_ROOT/$n" ]; then printf '  (exists)\n'; else printf '  (MISSING)\n'; fi
+  } | if command -v less >/dev/null 2>&1; then less -R; else cat; printf '\nPress Enter to return…'; read -r _; fi
+  resume_tui
+  STATUS="info: '$n'"
+  return 0
+}
+
+# Destroy asks inline on the status line (y/N); the delete itself is a job.
+act_destroy_ask() {
+  (( ${#VIEW[@]} == 0 )) && { STATUS="no instance selected"; return 0; }
+  CONFIRM_NAME=${NAMES[${VIEW[$SEL]}]}
+  if [ -n "${PENDING[$CONFIRM_NAME]:-}" ]; then
+    gerund "${PENDING[$CONFIRM_NAME]}"; STATUS="'$CONFIRM_NAME' is busy ($G) — try again when it finishes"
+    CONFIRM_NAME=""; return 0
+  fi
+  MODE=confirm
+  return 0
+}
+
+act_destroy_do() {
+  if start_job "$CONFIRM_NAME" delete incus delete "$CONFIRM_NAME" --force; then
+    STATUS="deleting '$CONFIRM_NAME' in the background…"
+  fi
+  CONFIRM_NAME=""
+  return 0
+}
+
+act_create_run() { # $1=raw name typed by the user
+  local raw="$1"
+  suspend_tui
+  "$HERE/cb" create "$raw" || true
+  printf '\nPress Enter to return to cb-tui…'; read -r _ || true
+  resume_tui
+  SEL_NAME="$(instance_name "$raw")"
+  STATUS="created '$SEL_NAME'"
+  invalidate
+  return 0
+}
+
+show_help() {
+  printf '\033[H\033[2J'
+  cat <<EOF
+${C_BOLD}cb-tui — keys and mouse${C_RESET}
+
+  ${C_CYAN}j / ↓${C_RESET}        move selection down            ${C_CYAN}mouse wheel${C_RESET}      scroll the list (selection stays)
+  ${C_CYAN}k / ↑${C_RESET}        move selection up              ${C_CYAN}click row${C_RESET}        select it
+  ${C_CYAN}PgDn / PgUp${C_RESET}  move one screen                ${C_CYAN}double-click${C_RESET}     login to that instance
+  ${C_CYAN}g / G${C_RESET}        jump to first / last           ${C_CYAN}click footer${C_RESET}     run that action (e.g. [s]tart)
+  ${C_CYAN}/${C_RESET}            live filter by name substring  ${C_CYAN}click docker-host${C_RESET} re-probe it now
+  ${C_CYAN}Esc${C_RESET}          clear the filter
+  ${C_CYAN}o${C_RESET}            toggle order: by name ⇄ running instances first
+  ${C_CYAN}s${C_RESET}            start selected instance        (runs in the background)
+  ${C_CYAN}x${C_RESET}            stop selected instance         (runs in the background)
+  ${C_CYAN}r${C_RESET}            restart selected instance      (start, if it is stopped)
+  ${C_CYAN}l / Enter${C_RESET}    login (shell as colin) — a stopped instance is started first
+  ${C_CYAN}i${C_RESET}            info: incus info + expanded config in a pager
+  ${C_CYAN}c${C_RESET}            create a new instance (clones dev-golden, wires docker-host)
+  ${C_CYAN}d${C_RESET}            destroy selected instance (asks y/N; code on disk is kept)
+  ${C_CYAN}?${C_RESET}            this help
+  ${C_CYAN}q${C_RESET}            quit (background operations keep running)
+
+  Holding a movement key is fine: queued keypresses are coalesced into a single
+  redraw. The list is a viewport sized to your terminal, refreshed every
+  ${TUI_FETCH_INTERVAL}s; docker-host is probed every ${TUI_DH_INTERVAL}s (${DH_ADDR}:${DH_PORT}).
+  Rows with a yellow spinner have an operation in flight; the selection follows
+  the instance name, so a re-sort never moves the cursor to a different one.
+  The wheel scrolls the pane without touching the selection — the footer shows
+  "↑ selection" / "↓ selection" when it is off-screen; any arrow key, j/k, or
+  g/G brings it back into view.
+
+Press any key or click to return…
+EOF
+  # Wait for a key or a mouse *press*. The release of the click that opened
+  # this screen arrives ~100ms later and must not close it again.
+  local ch
+  while read -rsn1 ch; do
+    key_token "$ch"
+    [[ "$KEY" == MOUSE && "$MPRESS" == 0 ]] && continue
+    break
+  done
+  drain_input
+}
+
+# --- input ---
+# Read the remainder of an escape sequence EXACTLY, never consuming the ESC of
+# the next sequence — that desync is what made held arrow keys lock up.
+# Also parses SGR mouse reports  ESC [ < button ; col ; row M|m  into
+# KEY=MOUSE + MB/MX/MY/MPRESS.
+read_escape() {
+  local a b c n
+  if ! read -rsn1 -t 0.02 a; then KEY=ESC; return 0; fi
+  if [[ "$a" != '[' && "$a" != 'O' ]]; then KEY=OTHER; return 0; fi
+  if ! read -rsn1 -t 0.02 b; then KEY=OTHER; return 0; fi
+  case "$b" in
+    A) KEY=UP;;   B) KEY=DOWN;; C) KEY=RIGHT;; D) KEY=LEFT;;
+    H) KEY=HOME;; F) KEY=END;;
+    '<')
+      n=""; c=""
+      while read -rsn1 -t 0.05 c; do
+        [[ "$c" == [Mm] ]] && break
+        n+="$c"
+        (( ${#n} > 20 )) && { KEY=OTHER; return 0; }
+      done
+      if [[ "$c" == [Mm] && "$n" =~ ^([0-9]+)\;([0-9]+)\;([0-9]+)$ ]]; then
+        MB=${BASH_REMATCH[1]}; MX=${BASH_REMATCH[2]}; MY=${BASH_REMATCH[3]}
+        MPRESS=0; [[ "$c" == M ]] && MPRESS=1
+        KEY=MOUSE
+      else
+        KEY=OTHER
+      fi
+      ;;
+    [0-9])
+      n="$b"
+      while read -rsn1 -t 0.02 c; do
+        [[ "$c" == '~' ]] && break
+        n+="$c"
+        (( ${#n} > 6 )) && break
+      done
+      case "$n" in
+        5) KEY=PGUP;; 6) KEY=PGDN;; 1|7) KEY=HOME;; 4|8) KEY=END;; *) KEY=OTHER;;
+      esac
+      ;;
+    *) KEY=OTHER;;
+  esac
+  return 0
+}
+
+# Turn a raw character into a KEY token.
+key_token() {
+  case "$1" in
+    $'\033')        read_escape;;
+    '')             KEY=ENTER;;
+    $'\x7f'|$'\b')  KEY=BS;;
+    *)              KEY="$1";;
+  esac
+  return 0
+}
+
+# Screen geometry: rows 1-2 header, 3..2+VIEW_ROWS list, then blank, hints, status.
+# Returns like apply_key. Releases are ignored; only presses act.
+handle_mouse() {
+  (( MPRESS )) || return 0
+  local b=$(( MB & ~28 ))     # strip shift(4)/meta(8)/ctrl(16) modifier bits
+  case "$b" in
+    64) SCROLL=$(( SCROLL - TUI_WHEEL_STEP )); FOLLOW=0; clamp_scroll; return 0;;
+    65) SCROLL=$(( SCROLL + TUI_WHEEL_STEP )); FOLLOW=0; clamp_scroll; return 0;;
+    0)  ;;
+    *)  return 0;;
+  esac
+  local total=${#VIEW[@]} i t now k
+  if (( MY >= 3 && MY <= 2 + VIEW_ROWS )); then
+    i=$(( SCROLL + MY - 3 ))
+    (( i >= total )) && return 0
+    t=$EPOCHREALTIME; now=$(( ${t%.*} * 1000 + 10#${t#*.} / 1000 ))
+    # Two presses on the selected row within the window = double-click. A press
+    # that was already queued behind the first (BURST) counts too: processing
+    # time is not arrival time when a fork delayed us.
+    if (( i == SEL && i == LAST_CLICK_ROW && (BURST || now - LAST_CLICK_MS < TUI_DCLICK_MS) )); then
+      LAST_CLICK_MS=0; LAST_CLICK_ROW=-1
+      act_login; return 2
+    fi
+    SEL=$i; clamp_sel; FOLLOW=1; LAST_CLICK_ROW=$i; LAST_CLICK_MS=$now
+    return 0
+  fi
+  if (( MY == 1 && MX >= DH_X0 && MX <= DH_X1 )); then
+    DH_TS=0; DH_CACHE=""; STATUS="re-probed docker-host"
+    return 0
+  fi
+  if (( MY == TLINES - 1 )); then
+    for k in "${!HINT_KEY[@]}"; do
+      if [ -n "${HINT_KEY[$k]}" ] && (( MX >= HINT_X0[k] && MX <= HINT_X1[k] )); then
+        KEY=${HINT_KEY[$k]}
+        apply_key; return $?
+      fi
+    done
+  fi
+  return 0
+}
+
+# Keys while typing into the status line (filter / create).
+apply_key_prompt() {
+  case "$KEY" in
+    ESC)
+      if [ "$MODE" = filter ]; then FILTER=""; reset_view; STATUS="filter cleared"
+      else STATUS="create cancelled"; fi
+      MODE=list; PBUF="";;
+    ENTER)
+      if [ "$MODE" = filter ]; then
+        MODE=list
+        if [ -n "$FILTER" ]; then STATUS="filter '$FILTER' → ${#VIEW[@]} match(es)"; else STATUS="filter cleared"; fi
+      else
+        MODE=list
+        if [ -n "$PBUF" ]; then act_create_run "$PBUF"; PBUF=""; return 2; fi
+        STATUS="create cancelled"
+      fi
+      PBUF="";;
+    BS)
+      PBUF=${PBUF%?}
+      [ "$MODE" = filter ] && { FILTER=$PBUF; reset_view; };;
+    UP)   [ "$MODE" = filter ] && { (( SEL-- )); clamp_sel; FOLLOW=1; };;
+    DOWN) [ "$MODE" = filter ] && { (( SEL++ )); clamp_sel; FOLLOW=1; };;
+    PGUP) [ "$MODE" = filter ] && { (( SEL -= VIEW_ROWS )); clamp_sel; FOLLOW=1; };;
+    PGDN) [ "$MODE" = filter ] && { (( SEL += VIEW_ROWS )); clamp_sel; FOLLOW=1; };;
+    MOUSE)   # a click accepts the filter / cancels create, then behaves as in list mode
+      (( MPRESS )) || return 0
+      [ "$MODE" = create ] && STATUS="create cancelled"
+      MODE=list; PBUF=""
+      handle_mouse; return $?;;
+    LEFT|RIGHT|HOME|END|OTHER) ;;
+    *)
+      if [[ ${#KEY} -eq 1 && "$KEY" == [[:print:]] ]]; then
+        PBUF+="$KEY"
+        [ "$MODE" = filter ] && { FILTER=$PBUF; reset_view; }
+      fi;;
+  esac
+  return 0
+}
+
+apply_key_confirm() {
+  case "$KEY" in
+    MOUSE) (( MPRESS )) || return 0; MODE=list; STATUS="destroy aborted"; CONFIRM_NAME="";;
+    y|Y)   MODE=list; act_destroy_do;;
+    *)     MODE=list; STATUS="destroy aborted"; CONFIRM_NAME="";;
+  esac
+  return 0
+}
+
+# 0 = handled (cheap, safe to coalesce), 1 = quit, 2 = heavy (stop coalescing)
+apply_key() {
+  case "$MODE" in
+    filter|create) apply_key_prompt;  return $?;;
+    confirm)       apply_key_confirm; return $?;;
+  esac
+  case "$KEY" in
+    UP|k|K)    ((SEL--));                     FOLLOW=1;;
+    DOWN|j|J)  ((SEL++));                     FOLLOW=1;;
+    PGUP)      ((SEL -= VIEW_ROWS));          FOLLOW=1;;
+    PGDN)      ((SEL += VIEW_ROWS));          FOLLOW=1;;
+    HOME|g)    SEL=0;                         FOLLOW=1;;
+    END|G)     SEL=$(( ${#VIEW[@]} - 1 ));    FOLLOW=1;;
+    LEFT|RIGHT|OTHER|BS) ;;
+    MOUSE)     handle_mouse; return $?;;
+    ESC)       if [ -n "$FILTER" ]; then FILTER=""; reset_view; STATUS="filter cleared"; fi;;
+    q|Q)       return 1;;
+    o|O)       if [ "$SORT" = name ]; then SORT=state; STATUS="order: running first"; else SORT=name; STATUS="order: by name"; fi
+               build_view;;
+    /)         MODE=filter; PBUF="$FILTER";;
+    c|C)       MODE=create; PBUF="";;
+    d|D)       act_destroy_ask;;
+    ENTER|l|L) act_login;             return 2;;
+    i|I)       act_info;              return 2;;
+    s|S)       act_lifecycle start;   return 2;;
+    x|X)       act_lifecycle stop;    return 2;;
+    r|R)       act_lifecycle restart; return 2;;
+    '?')       show_help;             return 2;;
+  esac
+  clamp_sel
+  return 0
+}
+
+# --- main ---
+main() {
+  need_incus
+  set +e  # a TUI tolerates non-zero returns (e.g. falsey (( )) tests); errexit off
+  build_footer   # --once never calls update_size
+
+  if (( ONCE )); then
+    COLS=999; build_footer   # not a terminal: never clip the hint line or names
+    fetch_instances
+    VIEW_ROWS=${#VIEW[@]}
+    render
+    exit 0
+  fi
+
+  [ -t 0 ] || die "cb-tui needs an interactive terminal (use --once for a single frame)"
+
+  JOBDIR="$(mktemp -d "${TMPDIR:-/tmp}/cb-tui.XXXXXX")"
+  setup_term
+  # EXIT does the restore. INT/TERM must *exit*: a bare handler would restore
+  # the screen and then let the loop keep painting frames onto the normal one.
+  trap cleanup_term EXIT
+  trap 'exit 130' INT TERM
+  trap 'NEED_SIZE=1' WINCH   # flag only; redrawing inside a trap can interleave
+
+  update_size; NEED_SIZE=0
+  # Fetch once up front: the timer below wouldn't fire on the first pass
+  # (SECONDS and LAST_FETCH both start at 0), leaving VIEW unpopulated.
+  fetch_instances
+  LAST_FETCH=$SECONDS
+
+  local ch now rc guard tick
+  while true; do
+    (( NEED_SIZE )) && { update_size; NEED_SIZE=0; }
+    reap_jobs; reap_fetch
+    now=$SECONDS
+    if (( NEED_FETCH || now - LAST_FETCH >= TUI_FETCH_INTERVAL )); then
+      start_fetch
+      LAST_FETCH=$now; NEED_FETCH=0
+    fi
+    render
+
+    # Faster ticks while jobs run so the spinner moves and results land promptly.
+    tick=$TUI_KEY_TIMEOUT; (( ${#JOBPID[@]} > 0 || ${#FETCH_PID} > 0 )) && tick=$TUI_JOB_TICK
+    read -rsn1 -t "$tick" ch || continue   # timeout → next frame
+    key_token "$ch"
+    apply_key; rc=$?
+    (( rc == 1 )) && break
+
+    # Coalesce autorepeat: drain everything already queued, applying moves but
+    # drawing only once at the top of the loop. Without this, a held key queues
+    # one full frame per keypress and the UI appears frozen.
+    if (( rc == 0 )); then
+      guard=0; BURST=1
+      while (( guard++ < TUI_DRAIN_MAX )) && read -rsn1 -t 0.001 ch; do
+        key_token "$ch"
+        apply_key; rc=$?
+        (( rc == 1 )) && { BURST=0; break 2; }
+        (( rc == 2 )) && break
+      done
+      BURST=0
+    fi
+  done
+}
+
+# Run only when executed directly (allows sourcing for tests).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

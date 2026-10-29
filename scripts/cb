@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Per-codebase container lifecycle.
+#   cb create  <name> [--vm] [--no-start]
+#                              clone dev-golden, parity-mount repo dir, start
+#   cb login   <name>          shell as colin (incus exec)
+#   cb docker-setup <name>     (re)inject docker-host SSH access into an instance
+#   cb github-setup <name>     (re)inject the GitHub PAT + git/gh credential wiring
+#   cb kiro-setup   <name>     (re)seed the host's kiro-cli auth into an instance
+#   cb start   <name>
+#   cb stop    <name>
+#   cb restart <name>
+#   cb destroy <name>          delete container (code on disk is kept)
+#   cb list
+#   cb status  <name>
+#   cb tui                     full-screen TUI (keyboard + mouse) to manage all instances
+
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=lib.sh
+source "$HERE/lib.sh"
+
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+cmd_create() {
+  local name vm=0 start=1
+  for a in "$@"; do
+    case "$a" in
+      --vm)       vm=1;;
+      --no-start) start=0;;
+      -*)         die "unknown flag: $a";;
+      *)          name="$a";;
+    esac
+  done
+  [ -n "${name:-}" ] || usage 1
+  name="$(instance_name "$name")"
+  need_incus; need_shared_code
+  image_exists || die "image '$IMAGE_ALIAS' missing; run scripts/build-golden.sh"
+  instance_exists "$name" && die "instance '$name' already exists"
+
+  if [ "$vm" = 1 ]; then
+    incus image info "$IMAGE_ALIAS" 2>/dev/null | grep -qiE 'Type:[[:space:]]*virtual-machine' \
+      || die "VM mode needs a VM-type golden image; '$IMAGE_ALIAS' is a container image. KVM works, but see .kiro/skills/incus/SKILL.md ('VM mode') to build a VM image + non-idmap profile first."
+  fi
+
+  local hostdir="$REPO_ROOT/$name"
+  mkdir -p "$hostdir"
+  info "creating '$name' from $IMAGE_ALIAS$([ "$vm" = 1 ] && echo ' (VM)')"
+  local -a vmflag=(); [ "$vm" = 1 ] && vmflag=(--vm)
+  if [ "$start" = 1 ]; then
+    incus launch "$IMAGE_ALIAS" "$name" -p "$PROFILE" "${vmflag[@]}"
+  else
+    incus create "$IMAGE_ALIAS" "$name" -p "$PROFILE" "${vmflag[@]}"
+  fi
+  info "parity-mounting $hostdir (same path in-VM)"
+  incus config device add "$name" workspace disk source="$hostdir" path="$hostdir"
+  # All injectors go through `incus file`, so they work on a stopped instance.
+  inject_docker_host "$name"
+  inject_github_pat "$name"
+  inject_kiro_auth "$name"
+  if [ "$start" = 1 ]; then
+    info "ready. Enter with: scripts/cb login $name  (repo path: $hostdir)"
+  else
+    info "created STOPPED. Start with: scripts/cb start $name  (repo path: $hostdir)"
+  fi
+}
+
+cmd_login()   { need_incus; local n; n="$(instance_name "$1")"; instance_exists "$n" || die "no such instance: $n"; exec incus exec "$n" -- su -l colin; }
+cmd_dockersetup() { need_incus; local n; n="$(instance_name "$1")"; instance_exists "$n" || die "no such instance: $n"; inject_docker_host "$n"; }
+cmd_githubsetup() { need_incus; local n; n="$(instance_name "$1")"; instance_exists "$n" || die "no such instance: $n"; inject_github_pat  "$n"; }
+cmd_kirosetup()   { need_incus; local n; n="$(instance_name "$1")"; instance_exists "$n" || die "no such instance: $n"; inject_kiro_auth  "$n"; }
+cmd_start()   { need_incus; incus start   "$(instance_name "$1")"; }
+cmd_stop()    { need_incus; incus stop    "$(instance_name "$1")"; }
+cmd_restart() { need_incus; incus restart "$(instance_name "$1")"; }
+cmd_status()  { need_incus; incus info    "$(instance_name "$1")"; }
+cmd_list()    { need_incus; incus list; }
+cmd_tui()     { exec "$HERE/cb-tui" "$@"; }
+
+cmd_destroy() {
+  need_incus; local n; n="$(instance_name "$1")"
+  instance_exists "$n" || die "no such instance: $n"
+  read -rp "Delete container '$n'? (code in $REPO_ROOT/$n is kept) [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || die "aborted"
+  incus delete "$n" --force
+  info "deleted '$n'"
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+  create)  cmd_create  "$@";;
+  login)   cmd_login   "${1:?name}";;
+  docker-setup) cmd_dockersetup "${1:?name}";;
+  github-setup) cmd_githubsetup "${1:?name}";;
+  kiro-setup)   cmd_kirosetup   "${1:?name}";;
+  start)   cmd_start   "${1:?name}";;
+  stop)    cmd_stop    "${1:?name}";;
+  restart) cmd_restart "${1:?name}";;
+  destroy) cmd_destroy "${1:?name}";;
+  status)  cmd_status  "${1:?name}";;
+  list)    cmd_list;;
+  tui)     cmd_tui "$@";;
+  -h|--help|help|"") usage 0;;
+  *) die "unknown command: $sub (try: cb help)";;
+esac

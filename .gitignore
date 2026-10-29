@@ -1,0 +1,28 @@
+# Secrets and local-only configuration
+.env
+.env.*
+*.secret
+*.key
+*.pem
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Editor and OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Generated VM/container artifacts should stay out of this repo.
+*.qcow2
+*.img
+*.iso
+*.vhd
+*.vhdx
+
+# Python bytecode
+__pycache__/
+*.pyc
